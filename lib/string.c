@@ -663,7 +663,6 @@ int __sysfs_match_string(const char * const *array, size_t n, const char *str)
 	return -EINVAL;
 }
 EXPORT_SYMBOL(__sysfs_match_string);
-
 #ifndef __HAVE_ARCH_MEMSET
 /**
  * memset - Fill a region of memory with the given value
