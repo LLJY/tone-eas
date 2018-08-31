@@ -19,11 +19,6 @@
  *  Adaptive scheduling granularity, math enhancements by Peter Zijlstra
  *  Copyright (C) 2007 Red Hat, Inc., Peter Zijlstra <pzijlstr@redhat.com>
  */
-/*
- * NOTE: This file has been modified by Sony Mobile Communications Inc.
- * Modifications are Copyright (c) 2015 Sony Mobile Communications Inc,
- * and licensed under the license of the file.
- */
 
 #include <linux/latencytop.h>
 #include <linux/sched.h>
@@ -2346,7 +2341,7 @@ static inline void decay_scaled_stat(struct sched_avg *sa, u64 periods);
 /* Initial task load. Newly created tasks are assigned this load. */
 unsigned int __read_mostly sched_init_task_load_pelt;
 unsigned int __read_mostly sched_init_task_load_windows;
-unsigned int __read_mostly sysctl_sched_init_task_load_pct = 15;
+unsigned int __read_mostly sysctl_sched_init_task_load_pct = 100;
 
 unsigned int max_task_load(void)
 {
@@ -2381,7 +2376,7 @@ unsigned int __read_mostly sysctl_sched_big_waker_task_load_pct = 25;
  * task. This eliminates the LPM exit latency associated with the idle
  * CPUs in the waker cluster.
  */
-unsigned int __read_mostly sysctl_sched_prefer_sync_wakee_to_waker = 1;
+unsigned int __read_mostly sysctl_sched_prefer_sync_wakee_to_waker;
 
 /*
  * CPUs with load greater than the sched_spill_load_threshold are not
@@ -2490,6 +2485,9 @@ void set_hmp_defaults(void)
 	update_up_down_migrate();
 
 #ifdef CONFIG_SCHED_FREQ_INPUT
+	sched_major_task_runtime =
+		mult_frac(sched_ravg_window, MAJOR_TASK_PCT, 100);
+
 	sched_freq_aggregate_threshold =
 		pct_to_real(sysctl_sched_freq_aggregate_threshold_pct);
 #endif
@@ -2581,24 +2579,11 @@ static DEFINE_MUTEX(boost_mutex);
 
 static void boost_kick_cpus(void)
 {
-	u32 nr_running;
 	int i;
 
 	for_each_online_cpu(i) {
-		/*
-		 * kick only "small" cluster
-		 */
-		if (cpu_capacity(i) != max_capacity) {
-			nr_running = ACCESS_ONCE(cpu_rq(i)->nr_running);
-
-			/*
-			 * make sense to interrupt CPU if its runqueue
-			 * has something running in order to check for
-			 * migration afterwards, otherwise skip it.
-			 */
-			if (nr_running)
-				boost_kick(i);
-		}
+		if (cpu_capacity(i) != max_capacity)
+			boost_kick(i);
 	}
 }
 
@@ -3051,35 +3036,12 @@ next_best_cluster(struct sched_cluster *cluster, struct cpu_select_env *env,
 	return next;
 }
 
-/*
- * Returns true, if a current task has RT/DL class:
- * SCHED_FIFO + SCHED_RR + SCHED_DEADLINE
- */
-static inline int
-is_curr_rt_prio(int cpu)
-{
-	int is_cpu_curr_rt_task;
-	struct task_struct *curr;
-
-	rcu_read_lock();
-
-	curr = READ_ONCE(cpu_rq(cpu)->curr); /* unlocked access */
-	is_cpu_curr_rt_task = task_has_rt_policy(curr) |
-		task_has_dl_policy(curr);
-
-	rcu_read_unlock();
-
-	return is_cpu_curr_rt_task;
-}
-
 #ifdef CONFIG_SCHED_HMP_CSTATE_AWARE
 static void __update_cluster_stats(int cpu, struct cluster_cpu_stats *stats,
 				   struct cpu_select_env *env, int cpu_cost)
 {
 	int cpu_cstate;
 	int prev_cpu = env->prev_cpu;
-	int is_high_prio_a;
-	int is_high_prio_b;
 
 	cpu_cstate = cpu_rq(cpu)->cstate;
 
@@ -3093,23 +3055,11 @@ static void __update_cluster_stats(int cpu, struct cluster_cpu_stats *stats,
 				stats->best_cpu_cstate = cpu_cstate;
 			}
 		} else {
-			if (env->cpu_load < stats->min_load) {
+			if (env->cpu_load < stats->min_load ||
+				(env->cpu_load == stats->min_load &&
+							cpu == prev_cpu)) {
 				stats->least_loaded_cpu = cpu;
 				stats->min_load = env->cpu_load;
-			} else if (env->cpu_load == stats->min_load) {
-				is_high_prio_a = is_curr_rt_prio(stats->least_loaded_cpu);
-				is_high_prio_b = is_curr_rt_prio(cpu);
-
-				if (is_high_prio_a && !is_high_prio_b) {
-					stats->least_loaded_cpu = cpu;
-					return;
-				}
-
-				if (!is_high_prio_a && is_high_prio_b)
-					return;
-
-				if (cpu == prev_cpu)
-					stats->least_loaded_cpu = cpu;
 			}
 		}
 
@@ -3123,25 +3073,6 @@ static void __update_cluster_stats(int cpu, struct cluster_cpu_stats *stats,
 		stats->best_cpu = cpu;
 		return;
 	}
-
-	/*
-	 * We try to escape of selecting CPUs with running RT
-	 * class tasks, if a power coast is the same. A reason
-	 * is to reduce a latency, since RT task may not be
-	 * preempted for a long time.
-	 */
-	is_high_prio_a = is_curr_rt_prio(stats->best_cpu);
-	is_high_prio_b = is_curr_rt_prio(cpu);
-
-	if (is_high_prio_a && !is_high_prio_b) {
-		stats->best_cpu_cstate = cpu_cstate;
-		stats->best_load = env->cpu_load;
-		stats->best_cpu = cpu;
-		return;
-	}
-
-	if (!is_high_prio_a && is_high_prio_b)
-		return;
 
 	/* CPU cost is the same. Start breaking the tie by C-state */
 
@@ -3173,79 +3104,30 @@ static void __update_cluster_stats(int cpu, struct cluster_cpu_stats *stats,
 				   struct cpu_select_env *env, int cpu_cost)
 {
 	int prev_cpu = env->prev_cpu;
-	int is_high_prio_a;
-	int is_high_prio_b;
 
 	if (cpu != prev_cpu && cpus_share_cache(prev_cpu, cpu)) {
 		if (stats->best_sibling_cpu_cost > cpu_cost ||
 		    (stats->best_sibling_cpu_cost == cpu_cost &&
 		     stats->best_sibling_cpu_load > env->cpu_load)) {
-
-			if (!is_curr_rt_prio(cpu)) {
-				stats->best_sibling_cpu_cost = cpu_cost;
-				stats->best_sibling_cpu_load = env->cpu_load;
-				stats->best_sibling_cpu = cpu;
-			}
+			stats->best_sibling_cpu_cost = cpu_cost;
+			stats->best_sibling_cpu_load = env->cpu_load;
+			stats->best_sibling_cpu = cpu;
 		}
 	}
 
-	if (env->need_idle) {
-		stats->min_cost = cpu_cost;
-		if (idle_cpu(cpu)) {
-			stats->best_idle_cpu = cpu;
+	if ((cpu_cost < stats->min_cost) ||
+	    ((stats->best_cpu != prev_cpu &&
+	      stats->min_load > env->cpu_load) || cpu == prev_cpu)) {
+		if (env->need_idle) {
+			if (idle_cpu(cpu)) {
+				stats->min_cost = cpu_cost;
+				stats->best_idle_cpu = cpu;
+			}
 		} else {
-			if (env->cpu_load < stats->min_load) {
-				stats->min_load = env->cpu_load;
-				stats->least_loaded_cpu = cpu;
-			} else if (env->cpu_load == stats->min_load) {
-				is_high_prio_a = is_curr_rt_prio(stats->least_loaded_cpu);
-				is_high_prio_b = is_curr_rt_prio(cpu);
-
-				if (is_high_prio_a && !is_high_prio_b) {
-					stats->least_loaded_cpu = cpu;
-					return;
-				}
-
-				if (!is_high_prio_a && is_high_prio_b)
-					return;
-
-				if (cpu == prev_cpu)
-					stats->least_loaded_cpu = cpu;
-			}
+			stats->min_cost = cpu_cost;
+			stats->min_load = env->cpu_load;
+			stats->best_cpu = cpu;
 		}
-
-		return;
-	}
-
-	if ((cpu_cost < stats->min_cost)) {
-		stats->min_cost = cpu_cost;
-		stats->min_load = env->cpu_load;
-		stats->best_cpu = cpu;
-		return;
-	}
-
-	/*
-	 * We try to escape of selecting CPUs with running RT
-	 * class tasks, if a power cost is the same. The reason
-	 * is to reduce a latency, since RT task may not be
-	 * preempted for a long time.
-	 */
-	is_high_prio_a = is_curr_rt_prio(stats->best_cpu);
-	is_high_prio_b = is_curr_rt_prio(cpu);
-
-	if (is_high_prio_a && !is_high_prio_b) {
-		stats->min_load = env->cpu_load;
-		stats->best_cpu = cpu;
-		return;
-	}
-
-	if (!is_high_prio_a && is_high_prio_b)
-		return;
-
-	if ((stats->best_cpu != prev_cpu &&
-			stats->min_load > env->cpu_load) || cpu == prev_cpu) {
-		stats->min_load = env->cpu_load;
-		stats->best_cpu = cpu;
 	}
 }
 #endif
@@ -3375,10 +3257,11 @@ bias_to_prev_cpu(struct cpu_select_env *env, struct cluster_cpu_stats *stats)
 }
 
 static inline bool
-wake_to_waker_cluster(struct cpu_select_env *env, int this_cpu)
+wake_to_waker_cluster(struct cpu_select_env *env)
 {
 	return !env->need_idle && !env->reason && env->sync &&
-		task_will_fit(env->p, this_cpu);
+	       task_load(current) > sched_big_waker_task_load &&
+	       task_load(env->p) < sched_small_wakee_task_load;
 }
 
 static inline int
@@ -3432,7 +3315,7 @@ static int select_best_cpu(struct task_struct *p, int target, int reason,
 			env.rtg = grp;
 	} else {
 		cluster = cpu_rq(cpu)->cluster;
-		if (wake_to_waker_cluster(&env, cpu)) {
+		if (wake_to_waker_cluster(&env)) {
 			if (sysctl_sched_prefer_sync_wakee_to_waker &&
 				cpu_rq(cpu)->nr_running == 1 &&
 				cpumask_test_cpu(cpu, tsk_cpus_allowed(p)) &&
@@ -6146,10 +6029,6 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (!se) {
 		update_rq_runnable_avg(rq, rq->nr_running);
 		add_nr_running(rq, 1);
-
-		if (unlikely(p->nr_cpus_allowed == 1))
-			rq->nr_pinned_tasks++;
-
 		inc_rq_hmp_stats(rq, p, 1);
 	}
 	hrtick_update(rq);
@@ -6214,10 +6093,6 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (!se) {
 		sub_nr_running(rq, 1);
 		update_rq_runnable_avg(rq, 1);
-
-		if (unlikely(p->nr_cpus_allowed == 1))
-			rq->nr_pinned_tasks--;
-
 		dec_rq_hmp_stats(rq, p, 1);
 	}
 	hrtick_update(rq);
@@ -7054,7 +6929,10 @@ again:
 		set_next_entity(cfs_rq, se);
 	}
 
-	goto done;
+	if (hrtick_enabled(rq))
+		hrtick_start_fair(rq, p);
+
+	return p;
 simple:
 	cfs_rq = &rq->cfs;
 #endif
@@ -7071,16 +6949,6 @@ simple:
 	} while (cfs_rq);
 
 	p = task_of(se);
-
-done: __maybe_unused
-#ifdef CONFIG_SMP
-	/*
-	 * Move the next running task to the front of
-	 * the list, so our cfs_tasks list becomes MRU
-	 * one.
-	 */
-	list_move(&p->se.group_node, &rq->cfs_tasks);
-#endif
 
 	if (hrtick_enabled(rq))
 		hrtick_start_fair(rq, p);
@@ -7592,12 +7460,11 @@ static void detach_task(struct task_struct *p, struct lb_env *env)
  */
 static struct task_struct *detach_one_task(struct lb_env *env)
 {
-	struct task_struct *p;
+	struct task_struct *p, *n;
 
 	lockdep_assert_held(&env->src_rq->lock);
 
-	list_for_each_entry_reverse(p,
-			&env->src_rq->cfs_tasks, se.group_node) {
+	list_for_each_entry_safe(p, n, &env->src_rq->cfs_tasks, se.group_node) {
 		if (!can_migrate_task(p, env))
 			continue;
 
@@ -7646,7 +7513,7 @@ static int detach_tasks(struct lb_env *env)
 
 redo:
 	while (!list_empty(tasks)) {
-		p = list_last_entry(tasks, struct task_struct, se.group_node);
+		p = list_first_entry(tasks, struct task_struct, se.group_node);
 
 		env->loop++;
 		/* We've more or less seen every task there is, call it quits */
@@ -7697,7 +7564,7 @@ redo:
 
 		continue;
 next:
-		list_move(&p->se.group_node, tasks);
+		list_move_tail(&p->se.group_node, tasks);
 	}
 
 	if (env->flags & (LBF_IGNORE_BIG_TASKS |
@@ -9963,22 +9830,6 @@ static inline int _nohz_kick_needed_hmp(struct rq *rq, int cpu, int *type)
 
 	if (!sysctl_sched_restrict_cluster_spill || sched_boost())
 		return 1;
-
-	if (unlikely(rq->nr_pinned_tasks > 0)) {
-		int delta = rq->nr_running - rq->nr_pinned_tasks;
-
-		/*
-		 * Check if it is possible to "unload" this CPU in case
-		 * of having pinned/affine tasks. Do not disturb idle
-		 * core if one of the below condition is true:
-		 *
-		 * - there is one pinned task and it is not "current"
-		 * - all tasks are pinned to this CPU
-		 */
-		if (delta < 2)
-			if (current->nr_cpus_allowed > 1 || !delta)
-				return 0;
-	}
 
 	if (cpu_max_power_cost(cpu) == max_power_cost)
 		return 1;
